@@ -12,7 +12,8 @@ from azure.storage.blob import (
     PageBlobService as _PageBlobService,
     BlockBlobService as _BlockBlobService,
     AppendBlobService as _AppendBlobService,
-    BlobBlock as _BlobBlock)
+    BlobBlock as _BlobBlock,
+    BlockListType as _BlockListType)
 from azure.storage.blob.models import _BlobTypes
 
 from pycosio.storage.azure import (
@@ -240,10 +241,11 @@ class AzureBlobRawIO(_ObjectRawIOBase):
         _ObjectRawIOBase.__init__(self, *args, **kwargs)
 
         # Detects blob type to use
+        # FIXME: No way to force a specific type (i.e., to upload page blob)
         try:
-            self._blob_type = self._head().get('blob_type', 'PageBlob')
+            self._blob_type = self._head().get('blob_type', _BlobTypes.BlockBlob)
         except _ObjectNotFoundError:
-            self._blob_type = _BlobTypes.PageBlob
+            self._blob_type = _BlobTypes.BlockBlob
 
         # Creates blob on write mode
         if 'x' in self.mode or 'w' in self.mode:
@@ -386,8 +388,10 @@ class AzureBlobBufferedIO(_ObjectBufferedIOBase):
 
         # Block blob: Commit put blocks to blob
         if self._blob_type == _BlobTypes.BlockBlob:
-            block_list = self._client[self._blob_type].get_block_list(**self._client_kwargs)
+            args = self._client_kwargs.copy()
+            args.update({'block_list_type': _BlockListType.All})
+            block_list = self._client[self._blob_type].get_block_list(**args)
 
+            # FIXME: How does this behave if modifying a portion of a file?
             self._client[self._blob_type].put_block_list(
-                block_list=block_list.committed_blocks +
-                self._blocks, **self._client_kwargs)
+                block_list=self._blocks, **self._client_kwargs)
