@@ -91,6 +91,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
                 self._max_buffers = ceil(self._size / self._buffer_size)
             self._read_queue = dict()
 
+        # Track if we attempted a close()
+        self._closed = False
+
     @property
     def _client(self):
         """
@@ -106,6 +109,10 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Flush the write buffers of the stream if applicable and
         close the object.
         """
+        if self._closed:
+            return
+        self._closed = True
+
         if self._writable:
             with self._seek_lock:
                 # Flush on close only if bytes written
@@ -138,6 +145,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         """
         Flush the write buffers of the stream if applicable.
         """
+        if self._closed:
+            raise ValueError('ValueError: I/O operation on closed file')
+
         if self._writable:
             with self._seek_lock:
                 # Advance seek
@@ -230,6 +240,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             bytes: Object content
         """
+        if self._closed:
+            raise ValueError('ValueError: I/O operation on closed file')
+
         if not self._readable:
             raise UnsupportedOperation('read')
 
@@ -427,6 +440,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             int: The new absolute position.
         """
+        if self._closed:
+            raise ValueError('ValueError: I/O operation on closed file')
+
         if not self._seekable:
             raise UnsupportedOperation('seek')
 
@@ -465,6 +481,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             int: The number of bytes written.
         """
+        if self._closed:
+            raise ValueError('ValueError: I/O operation on closed file')
+
         if not self._writable:
             raise UnsupportedOperation('write')
 
