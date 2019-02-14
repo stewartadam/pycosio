@@ -55,6 +55,32 @@ class _AzureBlobSystem(_SystemBase):
             self._client_block.copy_blob(
                 copy_source=src, **self.get_client_kwargs(dst))
 
+    def exists(self, path=None, client_kwargs=None):
+        """
+        Return True if path refers to an existing path.
+
+        Args:
+            path (str): Path or URL.
+            client_kwargs (dict): Client arguments.
+
+        Returns:
+            bool: True if exists.
+        """
+        if client_kwargs is None:
+            client_kwargs = self.get_client_kwargs(path)
+
+        if 'blob_name' in client_kwargs:
+            # Blob
+            try:
+                self.head(path, client_kwargs)
+            except _ObjectNotFoundError:
+                return False
+            return True
+        else:
+            # Container
+            # Azure offers no way to verify container exists with anything less than Account SAS - so assume true
+            return True
+
     def _get_client(self):
         """
         Azure blob service
@@ -368,6 +394,7 @@ class AzureBlobBufferedIO(_ObjectBufferedIOBase):
         elif self._blob_type == _BlobTypes.BlockBlob:
             block_id = self._random_block_id(32)
             self._blocks.append(_BlobBlock(id=block_id))
+
             self._write_futures.append(self._workers.submit(
                 self._client[self._blob_type].put_block, block=_BytesIO(self._get_buffer()),
                 block_id=block_id,
