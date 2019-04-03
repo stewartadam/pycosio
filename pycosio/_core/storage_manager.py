@@ -4,16 +4,27 @@ from collections import OrderedDict
 from importlib import import_module
 from threading import RLock
 
-from pycosio._core.io_raw import ObjectRawIOBase
-from pycosio._core.io_buffered import ObjectBufferedIOBase
-from pycosio._core.io_system import SystemBase
+from pycosio._core.io_base_raw import ObjectRawIOBase
+from pycosio._core.io_base_buffered import ObjectBufferedIOBase
+from pycosio._core.io_base_system import SystemBase
 from pycosio._core.compat import Pattern
 
+# Packages where to search for storage
+STORAGE_PACKAGE = ['pycosio.storage']
+
+# Mounted storage
 MOUNTED = OrderedDict()
 _MOUNT_LOCK = RLock()
+
+# List Base classes, and advanced base classes that are not abstract.
 _BASE_CLASSES = {
-    'raw': ObjectRawIOBase, 'buffered': ObjectBufferedIOBase,
+    'raw': ObjectRawIOBase,
+    'buffered': ObjectBufferedIOBase,
     'system': SystemBase}
+
+# Use this flag on subclass to make this class the default class for a
+# specific storage (Useful when a storage provides multiple class):
+# __DEFAULT_CLASS = True
 
 
 def get_instance(name, cls='system', storage=None, storage_parameters=None,
@@ -126,10 +137,17 @@ def mount(storage=None, name='', storage_parameters=None,
     # Saves get_storage_parameters
     system_parameters = _system_parameters(
         unsecure=unsecure, storage_parameters=storage_parameters)
-    storage_info = dict(system_parameters=system_parameters)
+    storage_info = dict(storage=storage, system_parameters=system_parameters)
 
     # Finds module containing target subclass
-    module = import_module('pycosio.storage.%s' % storage)
+    for package in STORAGE_PACKAGE:
+        try:
+            module = import_module('%s.%s' % (package, storage))
+            break
+        except ImportError:
+            continue
+    else:
+        raise ImportError('No storage named "%s" found' % storage)
 
     # Case module is a mount redirection to mount multiple storage at once
     if hasattr(module, 'MOUNT_REDIRECT'):
@@ -150,11 +168,32 @@ def mount(storage=None, name='', storage_parameters=None,
     for member_name in dir(module):
         member = getattr(module, member_name)
         for cls_name, cls in classes_items:
+
+            # Skip if not subclass of the target class
             try:
-                if issubclass(member, cls) and member is not cls:
-                    storage_info[cls_name] = member
+                if not issubclass(member, cls) or member is cls:
+                    continue
             except TypeError:
                 continue
+
+            # The class may have been flag as default or not-default
+            default_flag = '_%s__DEFAULT_CLASS' % member.__name__.strip('_')
+            try:
+                is_default = getattr(member, default_flag)
+            except AttributeError:
+                is_default = None
+
+            # Skip if explicitly flagged as non default
+            if is_default is False:
+                continue
+
+            # Skip if is an abstract class not explicitly flagged as default
+            elif is_default is not True and member.__abstractmethods__:
+                continue
+
+            # Is the default class
+            storage_info[cls_name] = member
+            break
 
     # Caches a system instance
     storage_info['system_cached'] = storage_info['system'](**system_parameters)

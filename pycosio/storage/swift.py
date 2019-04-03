@@ -6,6 +6,7 @@ from json import dumps as _dumps
 import swiftclient as _swift
 from swiftclient.exceptions import ClientException as _ClientException
 
+from pycosio._core.io_base import memoizedmethod as _memoizedmethod
 from pycosio._core.exceptions import (
     ObjectNotFoundError as _ObjectNotFoundError,
     ObjectPermissionError as _ObjectPermissionError)
@@ -52,13 +53,14 @@ class _SwiftSystem(_SystemBase):
     _SIZE_KEYS = ('content-length', 'content_length', 'bytes')
     _MTIME_KEYS = ('last-modified', 'last_modified')
 
-    def copy(self, src, dst):
+    def copy(self, src, dst, other_system=None):
         """
         Copy object of the same storage.
 
         Args:
             src (str): Path or URL.
             dst (str): Path or URL.
+            other_system (pycosio._core.io_system.SystemBase subclass): Unused.
         """
         container, obj = self.split_locator(src)
         with _handle_client_exception():
@@ -218,14 +220,17 @@ class SwiftRawIO(_ObjectRawIOBase):
     """
     _SYSTEM_CLASS = _SwiftSystem
 
-    def __init__(self, *args, **kwargs):
+    @property
+    @_memoizedmethod
+    def _client_args(self):
+        """
+        Client arguments as tuple.
 
-        # Initializes storage
-        _ObjectRawIOBase.__init__(self, *args, **kwargs)
-
-        # Prepares Swift I/O functions and common arguments
-        self._client_args = (
-            self._client_kwargs['container'], self._client_kwargs['obj'])
+        Returns:
+            tuple of str: Client args.
+        """
+        return (self._client_kwargs['container'],
+                self._client_kwargs['obj'])
 
     def _read_range(self, start, end=0):
         """
@@ -260,13 +265,16 @@ class SwiftRawIO(_ObjectRawIOBase):
         with _handle_client_exception():
             return self._client.get_object(*self._client_args)[1]
 
-    def _flush(self):
+    def _flush(self, buffer):
         """
         Flush the write buffers of the stream if applicable.
+
+        Args:
+            buffer (memoryview): Buffer content.
         """
         container, obj = self._client_args
         with _handle_client_exception():
-            self._client.put_object(container, obj, self._get_buffer())
+            self._client.put_object(container, obj, buffer)
 
 
 class SwiftBufferedIO(_ObjectBufferedIOBase):

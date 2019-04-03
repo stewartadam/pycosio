@@ -7,6 +7,7 @@ import oss2 as _oss
 from oss2.models import PartInfo as _PartInfo
 from oss2.exceptions import OssError as _OssError
 
+from pycosio._core.io_base import memoizedmethod as _memoizedmethod
 from pycosio._core.exceptions import (
     ObjectNotFoundError as _ObjectNotFoundError,
     ObjectPermissionError as _ObjectPermissionError)
@@ -33,7 +34,8 @@ def _handle_oss_error():
 
     except _OssError as exception:
         if exception.status in _ERROR_CODES:
-            raise _ERROR_CODES[exception.status](exception.details['Message'])
+            raise _ERROR_CODES[exception.status](
+                exception.details.get('Message', ''))
         raise
 
 
@@ -61,6 +63,24 @@ class _OSSSystem(_SystemBase):
                              *args, **kwargs)
         if self._unsecure:
             self._endpoint = self._endpoint.replace('https://', 'http://')
+
+    def copy(self, src, dst, other_system=None):
+        """
+        Copy object of the same storage.
+
+        Args:
+            src (str): Path or URL.
+            dst (str): Path or URL.
+            other_system (pycosio._core.io_system.SystemBase subclass): Unused.
+        """
+        copy_source = self.get_client_kwargs(src)
+        copy_destination = self.get_client_kwargs(dst)
+        with _handle_oss_error():
+            bucket = self._get_bucket(copy_destination)
+            bucket.copy_object(
+                source_bucket_name=copy_source['bucket_name'],
+                source_key=copy_source['key'],
+                target_key=copy_destination['key'])
 
     def get_client_kwargs(self, path):
         """
@@ -253,16 +273,9 @@ class _OSSSystem(_SystemBase):
                 response = bucket.list_objects(prefix=path, **kwargs)
 
             if not response.object_list:
-                # Must check if parent exits for empty directories
-                if path and '/' in path.strip('/'):
-                    with _handle_oss_error():
-                        parent_list = bucket.list_objects(
-                            prefix=path.strip('/').rsplit('/')[0],
-                            **kwargs).object_list
-                else:
-                    parent_list = None
-                if not parent_list:
-                    raise _ObjectNotFoundError('Not found: %s' % path)
+                # In case of empty dir, return empty dir path:
+                # if empty result, the dir do not exists.
+                raise _ObjectNotFoundError('Not found: %s' % path)
 
             for obj in response.object_list:
                 yield obj.key, self._model_to_dict(obj, ('key',))
@@ -289,12 +302,27 @@ class OSSRawIO(_ObjectRawIOBase):
     """
     _SYSTEM_CLASS = _OSSSystem
 
-    def __init__(self, *args, **kwargs):
-        _ObjectRawIOBase.__init__(self, *args, **kwargs)
+    @property
+    @_memoizedmethod
+    def _bucket(self):
+        """
+        Bucket client.
 
-        # Initializes oss2.Bucket object
-        self._bucket = self._system._get_bucket(self._client_kwargs)
-        self._key = self._client_kwargs['key']
+        Returns:
+            oss2.Bucket: Client.
+        """
+        return self._system._get_bucket(self._client_kwargs)
+
+    @property
+    @_memoizedmethod
+    def _key(self):
+        """
+        Object key.
+
+        Returns:
+            str: key.
+        """
+        return self._client_kwargs['key']
 
     def _read_range(self, start, end=0):
         """
@@ -308,20 +336,16 @@ class OSSRawIO(_ObjectRawIOBase):
         Returns:
             bytes: number of bytes read
         """
-        # Get object bytes range
-        try:
-            with _handle_oss_error():
-                response = self._bucket.get_object(key=self._key, headers=dict(
-                    Range=self._http_range(
-                        # Returns full file if end > size
-                        start, end if end <= self._size else self._size)))
+        if start >= self._size:
+            # EOF. Do not detect using 416 (Out of range) error, 200 returned.
+            return bytes()
 
-        # Check for end of file
-        except _OssError as exception:
-            if exception.status == 416:
-                # EOF
-                return bytes()
-            raise
+        # Get object bytes range
+        with _handle_oss_error():
+            response = self._bucket.get_object(key=self._key, headers=dict(
+                Range=self._http_range(
+                    # Returns full file if end > size
+                    start, end if end <= self._size else self._size)))
 
         # Get object content
         return response.read()
@@ -336,13 +360,15 @@ class OSSRawIO(_ObjectRawIOBase):
         with _handle_oss_error():
             return self._bucket.get_object(key=self._key).read()
 
-    def _flush(self):
+    def _flush(self, buffer):
         """
         Flush the write buffers of the stream if applicable.
+
+        Args:
+            buffer (memoryview): Buffer content.
         """
         with _handle_oss_error():
-            self._bucket.put_object(
-                key=self._key, data=self._get_buffer().tobytes())
+            self._bucket.put_object(key=self._key, data=buffer.tobytes())
 
 
 class OSSBufferedIO(_ObjectBufferedIOBase):
@@ -363,6 +389,9 @@ class OSSBufferedIO(_ObjectBufferedIOBase):
     """
 
     _RAW_CLASS = OSSRawIO
+
+    #: Minimal buffer_size in bytes (OSS multipart upload minimal part size)
+    MINIMUM_BUFFER_SIZE = 102400
 
     def __init__(self, *args, **kwargs):
         _ObjectBufferedIOBase.__init__(self, *args, **kwargs)
@@ -400,5 +429,12 @@ class OSSBufferedIO(_ObjectBufferedIOBase):
                  for future in self._write_futures]
 
         # Complete multipart upload
-        self._bucket.complete_multipart_upload(
-            key=self._key, upload_id=self._upload_id, parts=parts)
+        with _handle_oss_error():
+            try:
+                self._bucket.complete_multipart_upload(
+                    key=self._key, upload_id=self._upload_id, parts=parts)
+            except _OssError:
+                # Clean up failed upload
+                self._bucket.abort_multipart_upload(
+                    key=self._key, upload_id=self._upload_id)
+                raise

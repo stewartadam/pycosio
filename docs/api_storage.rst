@@ -15,8 +15,7 @@ The following table shows features available for each storage.
 API
 ---
 
-The following pages describes IO class for each storage. This give information
-on parameters to use to configure storage.
+The following pages describe each storage.
 
 .. automodule:: pycosio.storage
    :members:
@@ -27,7 +26,6 @@ on parameters to use to configure storage.
 
    api_storage_azure_blob
    api_storage_azure_file
-   api_storage_gs
    api_storage_http
    api_storage_oss
    api_storage_s3

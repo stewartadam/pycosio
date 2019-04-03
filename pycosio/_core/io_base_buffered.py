@@ -3,18 +3,19 @@
 from __future__ import division  # Python 2:  Enable "type(int / int) == float"
 
 from abc import abstractmethod
+from concurrent.futures import as_completed
 from io import BufferedIOBase, UnsupportedOperation
 from math import ceil
 from os import SEEK_SET
+from threading import Lock
 from time import sleep
 
-from pycosio._core.compat import ThreadPoolExecutor
-from pycosio._core.io_base import ObjectIOBase
-from pycosio._core.io_raw import ObjectRawIOBase
+from pycosio._core.io_base import ObjectIOBase, WorkerPoolBase
+from pycosio._core.io_base_raw import ObjectRawIOBase
 from pycosio._core.exceptions import handle_os_exceptions
 
 
-class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
+class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase, WorkerPoolBase):
     """
     Base class for buffered binary cloud storage object I/O
 
@@ -41,6 +42,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
     #: Minimal buffer_size value in bytes
     MINIMUM_BUFFER_SIZE = 1
 
+    #: Maximum buffer_size value in bytes (0 for no limit)
+    MAXIMUM_BUFFER_SIZE = 0
+
     # Time to wait before try a new flush
     # if number of buffer currently in flush > max_buffer
     _FLUSH_WAIT = 0.01
@@ -48,8 +52,14 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
     def __init__(self, name, mode='r', buffer_size=None,
                  max_buffers=0, max_workers=None, **kwargs):
 
+        if 'a' in mode:
+            # TODO: Implement append mode and remove this exception
+            raise NotImplementedError(
+                'Not implemented yet in Pycosio')
+
         BufferedIOBase.__init__(self)
         ObjectIOBase.__init__(self, name, mode=mode)
+        WorkerPoolBase.__init__(self, max_workers)
 
         # Instantiate raw IO
         self._raw = self._RAW_CLASS(
@@ -61,15 +71,14 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         self._name = self._raw.name
         self._client_kwargs = self._raw._client_kwargs
 
-        # Initialize parallel processing
-        self._workers_pool = None
-        self._workers_count = max_workers
-
         # Initializes buffer
         if not buffer_size or buffer_size < 0:
             self._buffer_size = self.DEFAULT_BUFFER_SIZE
         elif buffer_size < self.MINIMUM_BUFFER_SIZE:
             self._buffer_size = self.MINIMUM_BUFFER_SIZE
+        elif (self.MAXIMUM_BUFFER_SIZE and
+              buffer_size > self.MAXIMUM_BUFFER_SIZE):
+            self._buffer_size = self.MAXIMUM_BUFFER_SIZE
         else:
             self._buffer_size = buffer_size
 
@@ -80,6 +89,13 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
             self._write_buffer = bytearray(self._buffer_size)
             self._seekable = False
             self._write_futures = []
+            self._raw_flush = self._raw._flush
+
+            # Size used only with random write access
+            # Value will be lazy evaluated latter if needed.
+            self._size_synched = False
+            self._size = 0
+            self._size_lock = Lock()
 
         # Initialize read mode
         else:
@@ -102,37 +118,21 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             client
         """
-        return self._raw._system.client
+        return self._raw._client
 
     def close(self):
         """
         Flush the write buffers of the stream if applicable and
         close the object.
         """
-        if self._closed:
-            return
-        self._closed = True
-
-        if self._writable:
+        if self._writable and not self._closed:
+            self._closed = True
             with self._seek_lock:
-                # Flush on close only if bytes written
-                # This avoid no required process/thread
-                # creation and network call.
-                # This step is performed by raw stream.
-                if self._buffer_seek and self._seek:
-                    self._seek += 1
-                    with handle_os_exceptions():
-                        self._flush()
-                        self._close_writable()
+                self._flush_raw_or_buffered()
+            if self._seek:
+                with handle_os_exceptions():
+                    self._close_writable()
 
-                # If closed and data lower than buffer size
-                # flush data with raw stream to reduce IO calls
-                elif self._buffer_seek:
-                    self._raw._write_buffer = self._get_buffer()
-                    self._raw._seek = self._buffer_seek
-                    self._raw.flush()
-
-    @abstractmethod
     def _close_writable(self):
         """
         Closes the object in write mode.
@@ -140,6 +140,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Performs any finalization operation required to
         complete the object writing on the cloud.
         """
+        # Default implementation only wait for tasks termination
+        for future in as_completed(self._write_futures):
+            future.result()
 
     def flush(self):
         """
@@ -150,18 +153,31 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
 
         if self._writable:
             with self._seek_lock:
-                # Advance seek
-                # This is the number of buffer flushed
-                # including the current one
-                self._seek += 1
-
-                # Write buffer to cloud object
-                with handle_os_exceptions():
-                    self._flush()
+                self._flush_raw_or_buffered()
 
                 # Clear the buffer
                 self._write_buffer = bytearray(self._buffer_size)
                 self._buffer_seek = 0
+
+    def _flush_raw_or_buffered(self):
+        """
+        Flush using raw of buffered methods.
+        """
+        # Flush only if bytes written
+        # This avoid no required process/thread
+        # creation and network call.
+        # This step is performed by raw stream.
+        if self._buffer_seek and self._seek:
+            self._seek += 1
+            with handle_os_exceptions():
+                self._flush()
+
+        # If data lower than buffer size
+        # flush data with raw stream to reduce IO calls
+        elif self._buffer_seek:
+            self._raw._write_buffer = self._get_buffer()
+            self._raw._seek = self._buffer_seek
+            self._raw.flush()
 
     @abstractmethod
     def _flush(self):
@@ -192,6 +208,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             bytes: bytes read
         """
+        if not self._readable:
+            raise UnsupportedOperation('read')
+
         with self._seek_lock:
             self._raw.seek(self._seek)
             return self._raw._peek(size)
@@ -259,7 +278,8 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
                 self._preload_range()
 
             # Get buffer from future
-            buffer = self._read_queue.pop(queue_index).result()
+            with handle_os_exceptions():
+                buffer = self._read_queue.pop(queue_index).result()
 
             # Append another buffer preload at end of queue
             buffer_size = self._buffer_size
@@ -313,6 +333,9 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
         Returns:
             int: number of bytes read
         """
+        if not self._readable:
+            raise UnsupportedOperation('read')
+
         with self._seek_lock:
             # Gets seek
             seek = self._seek
@@ -353,12 +376,13 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
                     break
 
                 # Get buffer from future
-                try:
-                    queue[queue_index] = buffer = buffer.result()
+                with handle_os_exceptions():
+                    try:
+                        queue[queue_index] = buffer = buffer.result()
 
-                # Already evaluated
-                except AttributeError:
-                    pass
+                    # Already evaluated
+                    except AttributeError:
+                        pass
                 buffer_view = memoryview(buffer)
                 data_size = len(buffer)
 
@@ -451,24 +475,12 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
             # Set seek using raw method and
             # sync buffered seek with raw seek
             self.raw.seek(offset, whence)
-            self._seek = self.raw._seek
+            self._seek = seek = self.raw._seek
 
             # Preload starting from current seek
             self._preload_range()
 
-    @property
-    def _workers(self):
-        """Executor pool
-
-        Returns:
-            concurrent.futures.Executor: Executor pool"""
-        # Lazy instantiate workers pool on first call
-        if self._workers_pool is None:
-            self._workers_pool = ThreadPoolExecutor(
-                max_workers=self._workers_count)
-
-        # Get worker pool
-        return self._workers_pool
+        return seek
 
     def write(self, b):
         """
@@ -538,7 +550,8 @@ class ObjectBufferedIOBase(BufferedIOBase, ObjectIOBase):
                             sleep(flush_wait)
 
                     # Flush
-                    self._flush()
+                    with handle_os_exceptions():
+                        self._flush()
 
                     # Clear buffer
                     self._write_buffer = bytearray(buffer_size)

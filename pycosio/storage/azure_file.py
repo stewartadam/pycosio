@@ -2,21 +2,20 @@
 """Microsoft Azure Files Storage"""
 from __future__ import absolute_import  # Python 2: Fix azure import
 
-from io import BytesIO as _BytesIO
 import re as _re
 
 from azure.storage.file import FileService as _FileService
+from azure.storage.file.models import Directory as _Directory
 
+from pycosio._core.io_base import memoizedmethod as _memoizedmethod
 from pycosio.storage.azure import (
-    _handle_azure_exception, _update_storage_parameters, _get_time,
-    _update_listing_client_kwargs, _get_endpoint, _model_to_dict)
+    _handle_azure_exception, _AzureBaseSystem, _AzureStorageRawIORangeWriteBase)
 from pycosio.io import (
-    ObjectRawIOBase as _ObjectRawIOBase,
-    ObjectBufferedIOBase as _ObjectBufferedIOBase,
-    SystemBase as _SystemBase)
+    ObjectBufferedIORandomWriteBase as _ObjectBufferedIORandomWriteBase,
+    FileSystemBase as _FileSystemBase)
 
 
-class _AzureFileSystem(_SystemBase):
+class _AzureFileSystem(_AzureBaseSystem, _FileSystemBase):
     """
     Azure Files Storage system.
 
@@ -27,20 +26,21 @@ class _AzureFileSystem(_SystemBase):
         unsecure (bool): If True, disables TLS/SSL to improves
             transfer performance. But makes connection unsecure.
     """
-    _MTIME_KEYS = ('last_modified',)
-    _SIZE_KEYS = ('content_length',)
 
-    def copy(self, src, dst):
+    def copy(self, src, dst, other_system=None):
         """
         Copy object of the same storage.
 
         Args:
             src (str): Path or URL.
             dst (str): Path or URL.
+            other_system (pycosio.storage.azure._AzureBaseSystem subclass):
+                The source storage system.
         """
         with _handle_azure_exception():
             self.client.copy_file(
-                copy_source=src, **self.get_client_kwargs(dst))
+                copy_source=(other_system or self)._format_src_url(src, self),
+                **self.get_client_kwargs(dst))
 
     copy_from_azure_blobs = copy  # Allows copy from Azure Blobs Storage
 
@@ -51,23 +51,7 @@ class _AzureFileSystem(_SystemBase):
         Returns:
             azure.storage.file.fileservice.FileService: Service
         """
-        return _FileService(**_update_storage_parameters(
-            self._storage_parameters, self._unsecure))
-
-    @staticmethod
-    def _get_time(header, keys, name):
-        """
-        Get time from header
-
-        Args:
-            header (dict): Object header.
-            keys (tuple of str): Header keys.
-            name (str): Method name.
-
-        Returns:
-            float: The number of seconds since the epoch
-        """
-        return _get_time(header, keys, name)
+        return _FileService(**self._secured_storage_parameters())
 
     def get_client_kwargs(self, path):
         """
@@ -80,6 +64,9 @@ class _AzureFileSystem(_SystemBase):
         Returns:
             dict: client args
         """
+        # Remove query string from URL
+        path = path.split('?', 1)[0]
+
         share_name, relpath = self.split_locator(path)
         kwargs = dict(share_name=share_name)
 
@@ -118,9 +105,9 @@ class _AzureFileSystem(_SystemBase):
         # - https://<account>.file.core.windows.net/<share>/<file>
 
         # Note: "core.windows.net" may be replaced by another endpoint
-
-        return _re.compile(r'(https?://|smb://|//|\\)%s\.file\.%s' %
-                           _get_endpoint(self._storage_parameters)),
+        return _re.compile(
+            r'(https?://|smb://|//|\\)%s\.file\.%s' %
+            self._get_endpoint('file')),
 
     def _head(self, client_kwargs):
         """
@@ -145,7 +132,7 @@ class _AzureFileSystem(_SystemBase):
             else:
                 result = self.client.get_share_properties(**client_kwargs)
 
-        return _model_to_dict(result)
+        return self._model_to_dict(result)
 
     def _list_locators(self):
         """
@@ -156,28 +143,28 @@ class _AzureFileSystem(_SystemBase):
         """
         with _handle_azure_exception():
             for share in self.client.list_shares():
-                yield share.name, _model_to_dict(share)
+                yield share.name, self._model_to_dict(share)
 
-    def _list_objects(self, client_kwargs, path, max_request_entries):
+    def _list_objects(self, client_kwargs, max_request_entries):
         """
         Lists objects.
 
         args:
             client_kwargs (dict): Client arguments.
-            path (str): Path relative to current locator.
             max_request_entries (int): If specified, maximum entries returned
                 by request.
 
         Returns:
-            generator of tuple: object name str, object header dict
+            generator of tuple: object name str, object header dict,
+            directory bool
         """
-        client_kwargs = _update_listing_client_kwargs(
+        client_kwargs = self._update_listing_client_kwargs(
             client_kwargs, max_request_entries)
 
         with _handle_azure_exception():
-            for obj in self.client.list_directories_and_files(
-                    prefix=path, **client_kwargs):
-                yield obj.name, _model_to_dict(obj)
+            for obj in self.client.list_directories_and_files(**client_kwargs):
+                yield (obj.name, self._model_to_dict(obj),
+                       isinstance(obj, _Directory))
 
     def _make_dir(self, client_kwargs):
         """
@@ -222,7 +209,7 @@ class _AzureFileSystem(_SystemBase):
                 share_name=client_kwargs['share_name'])
 
 
-class AzureFileRawIO(_ObjectRawIOBase):
+class AzureFileRawIO(_AzureStorageRawIORangeWriteBase):
     """Binary Azure Files Storage Object I/O
 
     Args:
@@ -234,67 +221,60 @@ class AzureFileRawIO(_ObjectRawIOBase):
             "azure.storage.file.fileservice.FileService" for more information.
         unsecure (bool): If True, disables TLS/SSL to improves
             transfer performance. But makes connection unsecure.
+        content_length (int): Define the size to preallocate on new file
+            creation. This is not mandatory, and file will be resized on needs
+            but this allow to improve performance when file size is known in
+            advance.
     """
     _SYSTEM_CLASS = _AzureFileSystem
 
-    def __init__(self, *args, **kwargs):
-        _ObjectRawIOBase.__init__(self, *args, **kwargs)
+    #: Maximum size of one flush operation
+    MAX_FLUSH_SIZE = _FileService.MAX_RANGE_SIZE
 
-        # Creates blob on write mode
-        if 'x' in self.mode or 'w' in self.mode:
-            self._client.create_file(**self._client_kwargs)
+    @property
+    @_memoizedmethod
+    def _get_to_stream(self):
+        """
+        Azure storage function that read a range to a stream.
 
-    def _init_append(self):
+        Returns:
+            function: Read function.
         """
-        Initializes data on 'a' mode
-        """
-        # Supported by default
+        return self._client.get_file_to_stream
 
-    def _read_range(self, start, end=0):
+    @property
+    @_memoizedmethod
+    def _resize(self):
         """
-        Read a range of bytes in stream.
+        Azure storage function that resize an object.
+
+        Returns:
+            function: Resize function.
+        """
+        return self._client.resize_file
+
+    @property
+    @_memoizedmethod
+    def _create_from_size(self):
+        """
+        Azure storage function that create an object.
+
+        Returns:
+            function: Create function.
+        """
+        return self._client.create_file
+
+    def _update_range(self, data, **kwargs):
+        """
+        Update range with data
 
         Args:
-            start (int): Start stream position.
-            end (int): End stream position.
-                0 To not specify end.
-
-        Returns:
-            bytes: number of bytes read
+            data (bytes): data.
         """
-        stream = _BytesIO()
-        with _handle_azure_exception():
-            self._client.get_file_to_stream(
-                stream=stream, start_range=start,
-                end_range=end if end else None, **self._client_kwargs)
-        return stream.getvalue()
-
-    def _readall(self):
-        """
-        Read and return all the bytes from the stream until EOF.
-
-        Returns:
-            bytes: Object content
-        """
-        stream = _BytesIO()
-        with _handle_azure_exception():
-            self._client.get_file_to_stream(
-                stream=stream, **self._client_kwargs)
-        return stream.getvalue()
-
-    def _flush(self):
-        """
-        Flush the write buffers of the stream if applicable.
-        """
-        with _handle_azure_exception():
-            self._client.update_range(
-                data=self._get_buffer(),
-                # Append at end
-                start_range=self._size - len(self._get_buffer()),
-                end_range=self._size, **self._client_kwargs)
+        self._client.update_range(data=data, **kwargs)
 
 
-class AzureFileBufferedIO(_ObjectBufferedIOBase):
+class AzureFileBufferedIO(_ObjectBufferedIORandomWriteBase):
     """Buffered binary Azure Files Storage Object I/O
 
     Args:
@@ -310,24 +290,12 @@ class AzureFileBufferedIO(_ObjectBufferedIOBase):
             "azure.storage.file.fileservice.FileService" for more information.
         unsecure (bool): If True, disables TLS/SSL to improves
             transfer performance. But makes connection unsecure.
+        content_length (int): Define the size to preallocate on new file
+            creation. This is not mandatory, and file will be resized on needs
+            but this allow to improve performance when file size is known in
+            advance.
     """
     _RAW_CLASS = AzureFileRawIO
 
-    def _flush(self):
-        """
-        Flush the write buffers of the stream.
-        """
-        start_range = self._buffer_size * self._seek
-        end_range = start_range + self._buffer_size
-
-        self._write_futures.append(self._workers.submit(
-            self._client.update_range, data=self._get_buffer(),
-            start_range=start_range, end_range=end_range,
-            **self._client_kwargs))
-
-    def _close_writable(self):
-        """
-        Close the object in write mode.
-        """
-        for future in self._write_futures:
-            future.result()
+    #: Maximal buffer_size value in bytes (Maximum upload range size)
+    MAXIMUM_BUFFER_SIZE = _FileService.MAX_RANGE_SIZE

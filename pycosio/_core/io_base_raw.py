@@ -4,10 +4,11 @@ from abc import abstractmethod
 from io import RawIOBase, UnsupportedOperation
 from os import SEEK_CUR, SEEK_END, SEEK_SET
 
-from pycosio._core.compat import file_exits_error
-from pycosio._core.exceptions import ObjectNotFoundError, handle_os_exceptions
+from pycosio._core.compat import file_exits_error, permission_error
+from pycosio._core.exceptions import (
+    ObjectNotFoundError, ObjectPermissionError, handle_os_exceptions)
 from pycosio._core.io_base import ObjectIOBase, memoizedmethod
-from pycosio._core.io_system import SystemBase
+from pycosio._core.io_base_system import SystemBase
 
 
 class ObjectRawIOBase(RawIOBase, ObjectIOBase):
@@ -34,10 +35,23 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
     # System I/O class
     _SYSTEM_CLASS = SystemBase
 
+    #: Maximum size of one flush operation (0 for no limit)
+    MAX_FLUSH_SIZE = 0
+
     def __init__(self, name, mode='r', storage_parameters=None, **kwargs):
 
         RawIOBase.__init__(self)
         ObjectIOBase.__init__(self, name, mode=mode)
+
+        if storage_parameters is not None:
+            storage_parameters = storage_parameters.copy()
+
+        # Try to get cached head for this file
+        try:
+            self._cache['_head'] = storage_parameters.pop(
+                'pycosio.raw_io._head')
+        except (AttributeError, KeyError):
+            pass
 
         # Initializes system
         try:
@@ -64,19 +78,35 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
 
             # Initializes starting data
             if 'a' in mode:
+                # Initialize with existing file content
+                if self._exists() == 1:
+                    with handle_os_exceptions():
+                        self._init_append()
 
-                self._init_append()
-                self._seek = self._size
+                # Create new file
+                elif self._exists() == 0:
+                    with handle_os_exceptions():
+                        self._create()
+
+                else:
+                    raise permission_error(
+                        "Insufficient permission to check if file already "
+                        "exists.")
 
             # Checks if object exists,
             # and raise if it is the case
-            elif 'x' in mode:
-                try:
-                    self._head()
-                except ObjectNotFoundError:
-                    pass
-                else:
-                    raise file_exits_error
+            elif 'x' in mode and self._exists() == 1:
+                raise file_exits_error
+
+            elif 'x' in mode and self._exists() == -1:
+                raise permission_error(
+                    "Insufficient permission to check if file already "
+                    "exists.")
+
+            # Create new file
+            else:
+                with handle_os_exceptions():
+                    self._create()
 
         # Configure read mode
         else:
@@ -86,11 +116,13 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
 
     def _init_append(self):
         """
-        Initializes data on 'a' mode
+        Initializes file on 'a' mode.
         """
-        # By default, since appending is not supported by a majority or cloud
-        # storage, reads existing file content in write buffer
-        self._write_buffer[:] = self.readall()
+        # Require to load the full file content in buffer
+        self._write_buffer[:] = self._readall()
+
+        # Make initial seek position to current end of file
+        self._seek = self._size
 
     @property
     def _client(self):
@@ -107,9 +139,10 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         Flush the write buffers of the stream if applicable and
         close the object.
         """
-        if self._writable and not self._is_raw_of_buffered:
-            with self._seek_lock:
-                self._flush()
+        if self._writable and not self._is_raw_of_buffered and not self._closed:
+            self._closed = True
+            if self._write_buffer:
+                self.flush()
 
     def flush(self):
         """
@@ -118,13 +151,22 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         """
         if self._writable:
             with handle_os_exceptions():
-                self._flush()
+                self._flush(self._get_buffer())
 
     @abstractmethod
-    def _flush(self):
+    def _flush(self, buffer):
         """
         Flush the write buffers of the stream if applicable.
+
+        Args:
+            buffer (memoryview): Buffer content.
         """
+
+    def _create(self):
+        """
+        Create the file if not exists.
+        """
+        self._flush(memoryview(b''))
 
     def _get_buffer(self):
         """
@@ -147,6 +189,16 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         """
         return self._system.getsize(header=self._head().copy())
 
+    def _reset_head(self):
+        """
+        Reset memoized head and associated values.
+        """
+        for key in ('_size', '_head'):
+            try:
+                del self._cache[key]
+            except KeyError:
+                continue
+
     @memoizedmethod
     def _head(self):
         """
@@ -156,6 +208,23 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
             dict: header.
         """
         return self._system.head(client_kwargs=self._client_kwargs)
+
+    @memoizedmethod
+    def _exists(self):
+        """
+        Checks if file exists.
+
+        Returns:
+            int: 1 if exists, 0 if not exists, -1 if can't determine file
+                existence (Because no access permission)
+        """
+        try:
+            self._head()
+            return 1
+        except ObjectNotFoundError:
+            return 0
+        except ObjectPermissionError:
+            return -1
 
     @staticmethod
     def _http_range(start=0, end=0):
@@ -187,7 +256,8 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         """
         with self._seek_lock:
             seek = self._seek
-        return self._read_range(seek, seek + size)
+        with handle_os_exceptions():
+            return self._read_range(seek, seek + size)
 
     def readall(self):
         """
@@ -196,14 +266,18 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         Returns:
             bytes: Object content
         """
+        if not self._readable:
+            raise UnsupportedOperation('read')
+
         with self._seek_lock:
             # Get data starting from seek
-            if self._seek and self._seekable:
-                data = self._read_range(self._seek)
+            with handle_os_exceptions():
+                if self._seek and self._seekable:
+                    data = self._read_range(self._seek)
 
-            # Get all data
-            else:
-                data = self._readall()
+                # Get all data
+                else:
+                    data = self._readall()
 
             # Update seek
             self._seek += len(data)
@@ -229,6 +303,9 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         Returns:
             int: number of bytes read
         """
+        if not self._readable:
+            raise UnsupportedOperation('read')
+
         # Get and update stream positions
         size = len(b)
         with self._seek_lock:
@@ -237,7 +314,8 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
             self._seek = end
 
         # Read data range
-        read_data = self._read_range(start, end)
+        with handle_os_exceptions():
+            read_data = self._read_range(start, end)
 
         # Copy to bytes-like object
         read_size = len(read_data)
@@ -271,9 +349,9 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         Change the stream position to the given byte offset.
 
         Args:
-            offset: Offset is interpreted relative to the position indicated by
-                whence.
-            whence: The default value for whence is SEEK_SET.
+            offset (int): Offset is interpreted relative to the position
+                indicated by whence.
+            whence (int): The default value for whence is SEEK_SET.
                 Values for whence are:
                 SEEK_SET or 0 – start of the stream (the default);
                 offset should be zero or positive
@@ -288,6 +366,27 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
         if not self._seekable:
             raise UnsupportedOperation('seek')
 
+        seek = self._update_seek(offset, whence)
+
+        # If seek move out of file, add padding until new seek position.
+        if self._writable:
+            size = len(self._write_buffer)
+            if seek > size:
+                self._write_buffer[seek:size] = b'\0' * (seek - size)
+
+        return seek
+
+    def _update_seek(self, offset, whence):
+        """
+        Update seek value.
+
+        Args:
+            offset (int): Offset.
+            whence (int): Whence.
+
+        Returns:
+            int: Seek position.
+        """
         with self._seek_lock:
             if whence == SEEK_SET:
                 self._seek = offset
@@ -296,8 +395,8 @@ class ObjectRawIOBase(RawIOBase, ObjectIOBase):
             elif whence == SEEK_END:
                 self._seek = offset + self._size
             else:
-                raise ValueError('Unsupported whence "%s"' % whence)
-            return self._seek
+                raise ValueError('whence value %s unsupported' % whence)
+        return self._seek
 
     def write(self, b):
         """

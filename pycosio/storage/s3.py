@@ -20,6 +20,7 @@ _ERROR_CODES = {
     'AccessDenied': _ObjectPermissionError,
     'NoSuchKey': _ObjectNotFoundError,
     'InvalidBucketName': _ObjectNotFoundError,
+    'NoSuchBucket': _ObjectNotFoundError,
     '403': _ObjectPermissionError,
     '404': _ObjectNotFoundError}
 
@@ -58,6 +59,7 @@ class _S3System(_SystemBase):
         unsecure (bool): If True, disables TLS/SSL to improves
             transfer performance. But makes connection unsecure.
     """
+    _SIZE_KEYS = ('ContentLength',)
     _CTIME_KEYS = ('CreationDate',)
     _MTIME_KEYS = ('LastModified',)
 
@@ -65,13 +67,14 @@ class _S3System(_SystemBase):
         self._session = None
         _SystemBase.__init__(self, *args, **kwargs)
 
-    def copy(self, src, dst):
+    def copy(self, src, dst, other_system=None):
         """
         Copy object of the same storage.
 
         Args:
             src (str): Path or URL.
             dst (str): Path or URL.
+            other_system (pycosio._core.io_system.SystemBase subclass): Unused.
         """
         copy_source = self.get_client_kwargs(src)
         copy_destination = self.get_client_kwargs(dst)
@@ -151,7 +154,18 @@ class _S3System(_SystemBase):
                 # - http://s3-<region>.amazonaws.com/<bucket>/<key>
                 # - https://s3-<region>.amazonaws.com/<bucket>/<key>
                 _re.compile(r'https?://s3\.amazonaws\.com'),
-                _re.compile(r'https?://s3-%s\.amazonaws\.com' % region))
+                _re.compile(r'https?://s3-%s\.amazonaws\.com' % region),
+
+                # Transfer acceleration URL
+                # - http://<bucket>.s3-accelerate.amazonaws.com
+                # - https://<bucket>.s3-accelerate.amazonaws.com
+                # - http://<bucket>.s3-accelerate.dualstack.amazonaws.com
+                # - https://<bucket>.s3-accelerate.dualstack.amazonaws.com
+                _re.compile(
+                    r'https?://[\w.-]+\.s3-accelerate\.amazonaws\.com'),
+                _re.compile(
+                    r'https?://[\w.-]+\.s3-accelerate\.dualstack'
+                    r'\.amazonaws\.com'))
 
     @staticmethod
     def _get_time(header, keys, name):
@@ -225,7 +239,10 @@ class _S3System(_SystemBase):
                 return self.client.put_object(Body=b'', **client_kwargs)
 
             # Bucket
-            return self.client.create_bucket(Bucket=client_kwargs['Bucket'])
+            return self.client.create_bucket(
+                Bucket=client_kwargs['Bucket'],
+                CreateBucketConfiguration=dict(
+                    LocationConstraint=self._get_session().region_name))
 
     def _remove(self, client_kwargs):
         """
@@ -349,13 +366,16 @@ class S3RawIO(_ObjectRawIOBase):
         with _handle_client_error():
             return self._client.get_object(**self._client_kwargs)['Body'].read()
 
-    def _flush(self):
+    def _flush(self, buffer):
         """
         Flush the write buffers of the stream if applicable.
+
+        Args:
+            buffer (memoryview): Buffer content.
         """
         with _handle_client_error():
-            self._client.put_object(Body=self._get_buffer().tobytes(),
-                                    **self._client_kwargs)
+            self._client.put_object(
+                Body=buffer.tobytes(), **self._client_kwargs)
 
 
 class S3BufferedIO(_ObjectBufferedIOBase):
@@ -422,6 +442,15 @@ class S3BufferedIO(_ObjectBufferedIOBase):
             part['ETag'] = part.pop('response').result()['ETag']
 
         # Complete multipart upload
-        self._client.complete_multipart_upload(
-            MultipartUpload={'Parts': self._write_futures},
-            UploadId=self._upload_args['UploadId'], **self._client_kwargs)
+        with _handle_client_error():
+            try:
+                self._client.complete_multipart_upload(
+                    MultipartUpload={'Parts': self._write_futures},
+                    UploadId=self._upload_args['UploadId'],
+                    **self._client_kwargs)
+            except _ClientError:
+                # Clean up if failure
+                self._client.abort_multipart_upload(
+                    UploadId=self._upload_args['UploadId'],
+                    **self._client_kwargs)
+                raise
