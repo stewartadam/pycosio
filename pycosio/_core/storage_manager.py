@@ -28,7 +28,7 @@ _BASE_CLASSES = {
 
 
 def get_instance(name, cls='system', storage=None, storage_parameters=None,
-                 unsecure=None, *args, **kwargs):
+                 unsecure=None, assume_exists=None, *args, **kwargs):
     """
     Get a cloud object storage instance.
 
@@ -48,7 +48,7 @@ def get_instance(name, cls='system', storage=None, storage_parameters=None,
         pycosio._core.io_base.ObjectIOBase subclass: Instance
     """
     system_parameters = _system_parameters(
-        unsecure=unsecure, storage_parameters=storage_parameters)
+        unsecure=unsecure, assume_exists=assume_exists, storage_parameters=storage_parameters)
 
     # Gets storage information
     with _MOUNT_LOCK:
@@ -100,7 +100,7 @@ def get_instance(name, cls='system', storage=None, storage_parameters=None,
 
 
 def mount(storage=None, name='', storage_parameters=None,
-          unsecure=None, extra_root=None):
+          unsecure=None, assume_exists=None, extra_root=None):
     """
     Mount a new storage.
 
@@ -136,7 +136,7 @@ def mount(storage=None, name='', storage_parameters=None,
 
     # Saves get_storage_parameters
     system_parameters = _system_parameters(
-        unsecure=unsecure, storage_parameters=storage_parameters)
+        unsecure=unsecure, assume_exists=assume_exists, storage_parameters=storage_parameters)
     storage_info = dict(storage=storage, system_parameters=system_parameters)
 
     # Finds module containing target subclass
@@ -160,7 +160,7 @@ def mount(storage=None, name='', storage_parameters=None,
         for storage in getattr(module, 'MOUNT_REDIRECT'):
             result[storage] = mount(
                 storage=storage, storage_parameters=storage_parameters,
-                unsecure=unsecure)
+                unsecure=unsecure, assume_exists=assume_exists)
         return result
 
     # Finds storage subclass

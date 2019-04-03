@@ -40,7 +40,7 @@ class SystemBase(ABC, WorkerPoolBase):
     # Caches compiled regular expression
     _CHAR_FILTER = compile(r'[^a-z0-9]*')
 
-    def __init__(self, storage_parameters=None, unsecure=False, roots=None,
+    def __init__(self, storage_parameters=None, unsecure=False, roots=None, assume_exists=False,
                  **_):
         # Initialize worker pool
         WorkerPoolBase.__init__(self)
@@ -57,6 +57,7 @@ class SystemBase(ABC, WorkerPoolBase):
 
         self._storage_parameters = storage_parameters
         self._unsecure = unsecure
+        self._assume_exists = assume_exists
         self._storage = self.__module__.rsplit('.', 1)[1]
 
         # Initialize client
@@ -135,6 +136,8 @@ class SystemBase(ABC, WorkerPoolBase):
             self.head(path, client_kwargs)
         except ObjectNotFoundError:
             return False
+        except ObjectPermissionError:
+            return self._assume_exists
         return True
 
     @abstractmethod

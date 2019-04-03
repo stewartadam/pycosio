@@ -87,6 +87,8 @@ class _AzureBaseSystem(_SystemBase):
         self._endpoint = None
         self._endpoint_domain = None
         _SystemBase.__init__(self, *args, **kwargs)
+        if 'assume_exists' not in kwargs and 'storage_parameters' in kwargs:
+            self._assume_exists = 'sas_token' in kwargs['storage_parameters']
 
     @staticmethod
     def _get_time(header, keys, name):

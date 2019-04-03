@@ -213,3 +213,4 @@ class _AzureBlobSystem(_AzureBaseSystem):
 
             # Container
             return self._client_block.delete_container(**client_kwargs)
+
