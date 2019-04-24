@@ -149,7 +149,7 @@ def copyfile(src, dst, follow_symlinks=True):
             if not hasattr(dst, 'read') and not isdir(dirname(dst)):
                 raise IOError("No such file or directory: '%s'" % dst)
 
-        except ObjectPermissionError:
+        except PermissionError:
             # Unable to check target directory due to missing read access, but
             # do not raise to allow to write if possible
             pass
